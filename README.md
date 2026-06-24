@@ -1,6 +1,6 @@
-# sec-rag-assistant
+# sec-filings-rag
 
-![CI](https://github.com/Rahul-Kushal-Anchi/sec-rag-assistant/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Rahul-Kushal-Anchi/sec-filings-rag/actions/workflows/ci.yml/badge.svg)
 
 Production-grade RAG system over SEC 10-K and 10-Q filings — hybrid retrieval, cross-encoder reranking, structured citations, and an offline evaluation harness.
 
@@ -62,8 +62,8 @@ Three files written by hand — the design decisions an interviewer will probe:
 ## Quick Start
 
 ```bash
-git clone https://github.com/Rahul-Kushal-Anchi/sec-rag-assistant
-cd sec-rag-assistant
+git clone https://github.com/Rahul-Kushal-Anchi/sec-filings-rag
+cd sec-filings-rag
 cp .env.example .env          # add OPENAI_API_KEY and ANTHROPIC_API_KEY
 docker compose up -d postgres
 cd backend
@@ -78,7 +78,7 @@ cd ../frontend && npm install && npm run dev   # UI at http://localhost:5173
 ## Project Structure
 
 ```
-sec-rag-assistant/
+sec-filings-rag/
 ├── backend/
 │   ├── app/
 │   │   ├── ingest/       # HTML parser, embedder, recursive chunker
