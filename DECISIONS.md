@@ -1,116 +1,316 @@
 # Design Decisions
 
-Living document. Update as you make each choice. Each entry is your interview crib sheet.
+This document records the main technical decisions behind `sec-filings-rag`, including their rationale, trade-offs, measured results, and current limitations.
 
 ---
 
-## D1: Why pgvector and not Pinecone / Weaviate / FAISS?
+## D1: Why PostgreSQL and pgvector instead of Pinecone, Weaviate, or FAISS?
 
-**Decision:** Postgres + pgvector
+**Decision:** Use PostgreSQL with the pgvector extension.
 
-**Reasoning to defend in interview:**
-- Single datastore for both relational metadata and vectors — no separate vector DB to sync
-- pgvector supports HNSW indexes giving sub-100ms ANN search at this scale (~500 docs, ~50k chunks)
-- Citi specifically lists "PostgreSQL, Vector DBs" together in their JD
-- Trade-off: at billions of vectors, dedicated vector DBs win. Not our scale.
+**Reasoning:**
 
-**What I would do differently at 100x scale:** evaluate Qdrant or Vespa.
+* Filing metadata and embedding vectors remain in one datastore, avoiding synchronization between a relational database and a separate vector database.
+* PostgreSQL supports transactional ingestion, relational filtering, migrations, and vector search within the same operational system.
+* pgvector provides HNSW indexing with cosine-distance search, which is appropriate for the current corpus of 81,864 chunks from 125 filings across 25 tickers.
+* SQL filters can restrict retrieval by ticker, filing type, filing date, or other metadata before or alongside vector search.
+* The project only requires one persistence layer to operate and back up.
+
+**Trade-off:** A dedicated vector search system may provide better horizontal scaling, distributed indexing, and operational tooling at substantially larger corpus sizes.
+
+**At much larger scale:** Evaluate systems such as Qdrant, Vespa, Weaviate, or a managed vector service after benchmarking PostgreSQL under the expected workload.
 
 ---
 
 ## D2: Chunk Size, Overlap, and Recursive Splitting
 
-We chose an 800-character target chunk size — roughly 200 tokens for
-text-embedding-3-small — because SEC filing pages are dense, and this
-size is large enough to preserve financial context while still staying
-small enough for reliable embedding and retrieval. The 150-character
-overlap is about 18% of the chunk size, which gives the next chunk
-enough carryover context without creating too much duplicate text in
-the vector store. Instead of cutting every 800 characters blindly, the
-chunker uses recursive separators so it can prefer paragraph breaks,
-then line breaks, then sentence boundaries, then word boundaries before
-falling back to raw character splitting. This matters because SEC
-filings often contain long risk disclosures, legal language, tables
-converted into text, and section-based narratives where meaning can be
-lost if a sentence or paragraph is split in the wrong place. The result
-is a chunking strategy that balances retrieval accuracy, storage
-efficiency, and readability when answering questions from 10-K filings.
+**Decision:** Use an 800-character target chunk size with 150 characters of overlap and recursive separators.
+
+SEC filings contain dense financial prose, legal disclosures, converted tables, and long narrative sections. An 800-character target is large enough to retain useful financial context while remaining focused enough for retrieval and reranking.
+
+The 150-character overlap carries context across adjacent chunks without excessively duplicating content in the vector store.
+
+Instead of splitting at fixed character positions, the chunker attempts progressively smaller semantic boundaries:
+
+1. Section or paragraph boundaries
+2. Line breaks
+3. Sentence boundaries
+4. Word boundaries
+5. Raw character boundaries as a final fallback
+
+**Trade-off:** Smaller chunks can improve retrieval precision but may lose surrounding financial context. Larger chunks preserve context but increase embedding, reranking, and generation costs while potentially reducing retrieval precision.
+
+**Current corpus:**
+
+| Metric            |          Value |
+| ----------------- | -------------: |
+| Chunks            |         81,864 |
+| Filings           |            125 |
+| Tickers           |             25 |
+| Target chunk size | 800 characters |
+| Chunk overlap     | 150 characters |
 
 ---
 
-## D3: Hybrid retrieval scoring
+## D3: Hybrid Retrieval Scoring
 
-**Decision:** [Fill in after Day 3 afternoon]
+**Decision:** Combine dense and BM25 rankings using Reciprocal Rank Fusion with `k = 60`.
 
-Common approaches:
-- Reciprocal Rank Fusion (RRF) — score(d) = sum(1 / (60 + rank)) — simple, no tuning
-- Weighted linear — alpha * normalize(dense) + (1-alpha) * normalize(bm25)
-- Convex combination after min-max normalization
+The query pipeline retrieves:
 
-**Why this matters:** "Walk me through how you combined dense and sparse retrieval" — near-guaranteed question.
+* Top 20 candidates from dense pgvector search
+* Top 20 candidates from BM25 search
+* Top 20 combined candidates after Reciprocal Rank Fusion
+
+For a document (d), its fused score is:
+
+```text
+RRF(d) = Σ 1 / (k + rank(d))
+```
+
+The implementation uses:
+
+```text
+k = 60
+```
+
+**Why RRF instead of directly combining scores:**
+
+Dense cosine similarity and BM25 use different scoring scales. A weighted sum would first require normalization or calibration, and those normalization choices could behave differently across query types.
+
+RRF uses rank position rather than raw score, which:
+
+* Avoids score-scale mismatch
+* Requires little parameter tuning
+* Allows strong results from either retrieval method to remain competitive
+* Produces deterministic and explainable fusion behavior
+
+Dense retrieval helps when the question is semantically related but worded differently from the filing. BM25 helps when the question contains exact accounting terms, product names, numerical labels, or company-specific language.
+
+**Trade-off:** Standard RRF gives the ranked lists equal structural importance. A future evaluation could compare standard RRF with weighted RRF or a learned fusion model using the golden evaluation set.
 
 ---
 
-## D4: Why a cross-encoder reranker?
+## D4: Why Use a Cross-Encoder Reranker?
 
-**Decision:** Two-stage retrieval — retrieve top-50 with hybrid, rerank top-10 with ms-marco-MiniLM-L-6-v2.
+**Decision:** Apply `cross-encoder/ms-marco-MiniLM-L-6-v2` to the fused candidate set and pass the top five passages to answer generation.
 
 **Reasoning:**
-- Bi-encoders (dense embeddings) lose fine-grained relevance because query and doc are encoded independently
-- Cross-encoders see query+doc together, much more accurate but too slow on full corpus
-- Two-stage gets 80% of cross-encoder benefit at 5% of the cost
 
-**Numbers from my eval:**
-- Recall@10 without reranker: [fill in]
-- Recall@10 with reranker: [fill in]
-- Latency added by reranker: [fill in]ms
+Dense embedding models encode the question and document independently. This makes large-scale retrieval efficient, but it can miss fine-grained relationships between a specific question and a candidate passage.
+
+A cross-encoder evaluates the question and passage together, allowing it to model token-level interactions and produce a more precise relevance score.
+
+The two-stage design balances efficiency and relevance:
+
+1. Dense and BM25 retrieval rapidly reduce the corpus to a small candidate set.
+2. RRF combines both rankings.
+3. The cross-encoder reranks the fused candidates.
+4. Only the top five passages enter the LLM context.
+
+**Measured system result:**
+
+* Current end-to-end query latency is approximately 15–18 seconds.
+
+This is the complete request latency and includes query embedding, retrieval, fusion, reranking, generation, and network time.
+
+**Measurement limitation:** Reranker-only latency and Recall@10 with and without reranking have not yet been isolated in a controlled benchmark. The project should not claim a reranking improvement percentage until that experiment is run.
+
+**Next evaluation:**
+
+* Measure reranker latency separately
+* Compare retrieval Recall@5 and Recall@10 before and after reranking
+* Record relevance changes on the same golden questions
+* Profile each pipeline stage independently
 
 ---
 
-## D5: Why structured outputs (Pydantic) instead of free-form generation?
+## D5: Why Structured Outputs Instead of Free-Form Generation?
 
-**Decision:** All LLM responses pass through Pydantic schema: Answer { text, citations: list[Citation], confidence: float }.
+**Decision:** Represent answers and citations through typed Pydantic response schemas.
+
+The response contract includes answer text, structured citations, confidence information, and source metadata.
 
 **Reasoning:**
-- Citations need to be programmatically clickable — can't trust free-form "[1][2]" text
-- Confidence score lets us route low-confidence answers to "I don't know" instead of hallucinating
-- Pydantic validation = automatic retry on schema failures
+
+* The frontend needs stable citation fields to render clickable and inspectable source cards.
+* Typed responses make API behavior easier to test.
+* Validation catches malformed output before it reaches the client.
+* Filing metadata can be returned independently from generated prose.
+* Downstream code does not need to parse informal citation markers such as `[1]` or `[2]`.
+
+**Trade-off:** Structured generation adds schema constraints and error-handling complexity, but it provides a more reliable application interface than unrestricted text.
 
 ---
 
-## D6: How did you measure hallucination [X]% to [Y]%?
+## D6: How Is Grounding and Hallucination Risk Evaluated?
 
-**Decision:** [Fill in after Day 7 eval]
+**Decision:** Use a filing-derived golden question set, structured citations, expected-answer keywords, confidence measurements, and planned manual validation.
 
-**Methodology:**
-- Built a 120-question golden set [describe how]
-- Each question has a ground-truth answer span from the source filing
-- For each generated answer, compute RAGAS faithfulness score
-- Threshold: faithfulness < 0.7 = hallucination
-- Baseline (naive dense retrieval): [X]% hallucination
-- Final (hybrid + rerank + structured output): [Y]%
+The current evaluation harness contains 20 golden questions across AAPL and JPM filings. Expected keywords are derived from the actual filing content rather than generated independently.
 
-**Honest caveat:** RAGAS uses an LLM judge with its own bias. Cross-validated 30 samples manually; LLM judge agreed with me on [N]/30.
+The evaluation records:
+
+* Expected keyword coverage
+* Answer confidence
+* End-to-end latency
+* Citation presence
+* Provider usage
+* Whether the answer is supported by retrieved filing passages
+
+**Current observed results:**
+
+| Query category      | Observed confidence |
+| ------------------- | ------------------: |
+| Financial queries   |               0.997 |
+| Risk-factor queries |               0.862 |
+
+These confidence values are system outputs and are not equivalent to a measured hallucination rate.
+
+**Grounding controls:**
+
+* The generation prompt instructs the model to answer only from retrieved filing context.
+* Answers include structured filing citations.
+* Retrieved passages retain ticker, form type, filing date, section, page, and source snippet metadata.
+* The model is instructed to state when the supplied context is insufficient.
+* Golden answers are tied to content present in the underlying filings.
+
+**Honest limitation:** The project does not currently have enough evidence to claim that hallucination decreased from a specific percentage to another specific percentage. A defensible hallucination-rate claim would require a larger labeled dataset, a written annotation rubric, blinded human review, and inter-rater agreement or a separately validated judge model.
+
+**Future evaluation:**
+
+* Expand the golden set beyond 20 questions
+* Add answer-level faithfulness scoring
+* Manually review a statistically meaningful sample
+* Separate retrieval failures from generation failures
+* Report confidence calibration rather than treating confidence as correctness
 
 ---
 
-## D7: Why streaming responses?
+## D7: Why Stream Responses?
 
-**Decision:** Stream tokens via SSE from FastAPI to React.
+**Decision:** Stream answer tokens from FastAPI to the React client using Server-Sent Events.
 
-**Reasoning:** First-token latency matters more than total latency for chat UX.
+**Reasoning:** The current pipeline has an end-to-end latency of approximately 15–18 seconds. Streaming reduces perceived waiting time by allowing the user to begin reading before the complete answer is available.
 
----
-
-## D8: What didn't work / what would you do next?
-
-[Fill in honestly during the build — every failure mode you discovered]
+**Trade-off:** Streaming improves perceived latency but does not reduce total computation time. Errors, citations, and final metadata must also be handled correctly when the response is delivered incrementally.
 
 ---
 
-## D9: Production concerns
+## D8: What Did Not Work, and What Would Be Improved Next?
 
-- **Cost:** Embedding 500 filings = $[X]; ongoing query embeddings = $[Y]/1k queries
-- **PII / safety:** SEC filings are public, no PII concern. Would change for internal docs.
-- **Online eval:** would sample 1% of real queries, run through stronger judge model offline
-- **Index updates:** rebuild takes ~[N] min; incremental updates supported via chunk.updated_at
+### Oversized Docker build context
+
+The initial backend Docker build sent approximately 952.92 MB of build context because the local virtual environment and development caches were not excluded.
+
+The primary contributors were:
+
+* `backend/.venv`
+* `backend/.mypy_cache`
+* Python and testing caches
+
+Adding `backend/.dockerignore` reduced the transferred build context to approximately 2 KB during the verified build.
+
+**Lesson:** Docker build context must be treated as part of the production build design. Local development artifacts should never be copied into the image or uploaded to a remote builder.
+
+### Documentation duplicated repository overview content
+
+The original architecture document largely duplicated the README and retained stale repository references.
+
+It was replaced with a dedicated architecture document describing ingestion, retrieval, fusion, reranking, generation, citations, and system trade-offs.
+
+**Lesson:** The README should explain how to understand and run the project, while architecture documentation should explain how and why the system works.
+
+### End-to-end latency remains high
+
+The measured 15–18 second response time is acceptable for a portfolio demonstration but is too slow for a polished production chat experience.
+
+**Next steps:**
+
+* Measure query embedding, retrieval, reranking, and generation separately
+* Cache repeated query embeddings where appropriate
+* Benchmark faster generation models
+* Reduce unnecessary context tokens
+* Evaluate reranker batch size and candidate count
+* Retain streaming for perceived responsiveness
+
+### BM25 is currently maintained in memory
+
+The in-memory BM25 index is simple and suitable for the current project, but it introduces rebuild and synchronization concerns as the corpus grows.
+
+**At larger scale:** Persist the sparse index or move lexical retrieval to a system designed for durable distributed search.
+
+---
+
+## D9: Production Concerns
+
+### Cost
+
+The estimated cost of embedding the complete current corpus is approximately **$3–8**.
+
+This is an engineering estimate based on corpus size and embedding usage, not a value reconciled against a provider billing statement.
+
+Per-query embedding and generation costs have not yet been measured separately. Production reporting should capture:
+
+* Embedding tokens
+* Input and output generation tokens
+* Provider and model used
+* Retry attempts
+* Cost per successful query
+* Cost per failed query
+
+### Corpus scale
+
+The current indexed corpus contains:
+
+* 81,864 chunks
+* 125 SEC filings
+* 25 tickers
+
+These values should be reported separately from future target scale.
+
+### Privacy and safety
+
+SEC filings are public documents, so the current application does not process private internal company documents.
+
+A deployment over private documents would require:
+
+* Access control
+* Tenant isolation
+* Encryption and key management
+* Audit logging
+* Data-retention policies
+* Protection against sensitive data appearing in traces or prompts
+
+### Online evaluation
+
+A production system should sample a controlled portion of real queries for offline evaluation while excluding sensitive content.
+
+Evaluation should monitor:
+
+* Retrieval relevance
+* Unsupported-answer rate
+* Citation validity
+* Empty-result frequency
+* Latency percentiles
+* Provider fallback frequency
+* User feedback
+
+### Index updates
+
+The ingestion design supports adding or updating filings without replacing the entire database. However, complete index rebuild duration has not yet been benchmarked and should not be reported as a measured value.
+
+Production ingestion should be idempotent and track filing accession numbers, chunk versions, ingestion status, and update timestamps.
+
+### Reliability
+
+Production deployment should include:
+
+* Provider timeouts and retry limits
+* LLM fallback behavior
+* Database connection-pool monitoring
+* Health and readiness checks
+* Rate limiting
+* Structured logs
+* Prometheus metrics
+* Alerting on latency, error rate, and failed ingestion jobs
