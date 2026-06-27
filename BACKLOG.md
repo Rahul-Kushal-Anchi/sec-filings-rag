@@ -1,51 +1,77 @@
-# Backlog — parked ideas (do NOT implement before submission)
+# Backlog
 
-Things that would be cool but are explicitly out of scope for the 5-7 day build. In interview, "what would you do next" answers come from here.
+Known limitations and future improvements. These inform what to improve next during technical review.
 
-## Retrieval improvements
-- HyDE (Hypothetical Document Embeddings)
-- Query rewriting / multi-query retrieval
-- A/B test different embedding models
-- Tune alpha weight on hybrid scoring via dev-set tuning
-- Add bge-reranker-base as alternative
-- Filter by metadata before vector search
+---
 
-## Generation improvements
-- Self-consistency: generate 3 answers, vote
-- Chain-of-verification: post-hoc "is this supported?" check
-- Cost-based model routing (Claude/GPT-4o-mini based on complexity)
-- Context compression via smaller summarizer model
+## Retrieval Improvements
 
-## Eval improvements
-- Online eval on 1% of real queries
-- Expand golden set to 500 questions
-- Per-section accuracy breakdown
-- Add comprehensiveness/conciseness metrics
+- HyDE (Hypothetical Document Embeddings) — generate a hypothetical answer, embed it, and retrieve against that vector
+- Query rewriting and multi-query retrieval — decompose complex questions into sub-queries
+- A/B test different embedding models — compare text-embedding-3-small against text-embedding-3-large and open-source alternatives
+- Tune RRF parameters or evaluate weighted RRF using a dev set
+- Add bge-reranker-base as an alternative cross-encoder
+- Pre-filter by metadata such as ticker, filing date and form type before vector search
 
-## Production / scale
-- Cache embeddings of repeated queries
-- Rate limiting per user
-- Move BM25 index to OpenSearch
-- Background re-indexing for new filings
-- Queue (Celery + Redis) for ingestion
-- Sharded pgvector for 10M+ chunks
+---
 
-## UX
-- Multi-turn conversation with memory
-- "Compare X across Y companies" template
-- Citation hover preview
-- Export answer as PDF with endnotes
+## Generation Improvements
 
-## Safety
-- PII detector on queries
-- Audit log
-- Output safety filter
-- Source attribution UI
+- Self-consistency — generate multiple answers and vote on the most supported response
+- Chain-of-verification — check whether each claim is supported by the retrieved passages
+- Cost-based model routing — use a smaller mple factual queries and a stronger model for complex multi-part questions
+- Context compression — summarize retrieved passages before sending them to the generation model to reduce token usage
 
-## Parser improvements 
-- Section name regex on iXBRL filings occasionally captures trailing words
-  ("Risk Factors The") or truncates long titles ("Market for Registrant"
-  instead of full "Market for Registrant's Common Equity, Related
-  Stockholder Matters...")
-- Acceptable for current scope because chunker uses section labels for metadata only; LLM retrieval is driven by chunk content, not labels
-- Would refine via corpus-wide regex training or LLM-based section header extraction on a per-filing basis (~4 hours of work, low ROI right now)
+---
+
+## Evaluation Improvements
+
+- Expand the golden question set beyond 20 questions across more tickers
+- Add per-section accuracy breakdown
+- Add faithfulness and comprehensiveness metrics
+- Sample a controlled percentage of real queries for offline review
+- Separate retrieval failure rate from generation failure rate
+
+---
+
+## Production and Scale
+
+- Cache embeddings for repeated queries
+- Add rate limiting per user or API key
+- Move BM25 to OpenSearch or Elasticsearch for durable distributed lexical search
+- Add a background re-indexing pipeline for new filings
+- Add an async ingestion queue using Celery and Redis
+- Evaluate sharded pgvector for corpora exceeding tens of millions of chunks
+
+---
+
+## User Experience
+
+- Multi-turn conversation with session memory
+- Cross-company comparison queries
+- Citation hovepreview showing full passage context
+- Export answers as PDF with numbered endnotes
+
+---
+
+## Safety and Compliance
+
+- PII detection on user queries before retrieval
+- Audit logging for queries and answers
+- Output safety filtering
+- Source attribution display in the UI
+
+---
+
+## Known Parser Limitations
+
+Section-name extraction on iXBRL filings can occasionally capture trailing words or truncate long titles.
+
+Examples:
+
+- "Risk Factors The" instead of "Risk Factors"
+- "Market for Registrant" instead of the full section title
+
+This is acceptable for the current corpus because retrieval is driven by chunk content rather than section labels. Section labels are used only for citation metadata.
+
+A more robust solution would involve corpus-wide regex refinement or LLM-based section-header extraction on a per-filing basis.
